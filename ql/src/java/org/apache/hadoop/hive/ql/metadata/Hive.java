@@ -18,30 +18,8 @@
 
 package org.apache.hadoop.hive.ql.metadata;
 
-import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
-import static org.apache.hadoop.hive.serde.serdeConstants.COLLECTION_DELIM;
-import static org.apache.hadoop.hive.serde.serdeConstants.ESCAPE_CHAR;
-import static org.apache.hadoop.hive.serde.serdeConstants.FIELD_DELIM;
-import static org.apache.hadoop.hive.serde.serdeConstants.LINE_DELIM;
-import static org.apache.hadoop.hive.serde.serdeConstants.MAPKEY_DELIM;
-import static org.apache.hadoop.hive.serde.serdeConstants.SERIALIZATION_FORMAT;
-import static org.apache.hadoop.hive.serde.serdeConstants.STRING_TYPE_NAME;
-
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Set;
-
+import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -121,7 +99,33 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.thrift.TException;
 
-import com.google.common.collect.Sets;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
+import static org.apache.hadoop.hive.serde.serdeConstants.COLLECTION_DELIM;
+import static org.apache.hadoop.hive.serde.serdeConstants.ESCAPE_CHAR;
+import static org.apache.hadoop.hive.serde.serdeConstants.FIELD_DELIM;
+import static org.apache.hadoop.hive.serde.serdeConstants.LINE_DELIM;
+import static org.apache.hadoop.hive.serde.serdeConstants.MAPKEY_DELIM;
+import static org.apache.hadoop.hive.serde.serdeConstants.SERIALIZATION_FORMAT;
+import static org.apache.hadoop.hive.serde.serdeConstants.STRING_TYPE_NAME;
 
 
 /**
@@ -2564,16 +2568,29 @@ private void constructOneLBLocationMap(FileStatus fSta,
   //method is called. when the replace value is true, this method works a little different
   //from mv command if the destf is a directory, it replaces the destf instead of moving under
   //the destf. in this case, the replaced destf still preserves the original destf's permission
-  public static boolean moveFile(HiveConf conf, Path srcf, Path destf,
-      FileSystem fs, boolean replace, boolean isSrcLocal) throws HiveException {
+  public static boolean moveFile(final HiveConf conf, final Path srcf, final Path destf,
+      final FileSystem fs, final boolean replace, boolean isSrcLocal, HadoopShims.HdfsEncryptionShim hdfsEncryptionShim) throws HiveException {
     boolean success = false;
+    final FileSystem srcFs, destFs;
+    try {
+      srcFs = srcf.getFileSystem(conf);
+    } catch (IOException e) {
+      LOG.error("Failed to get src fs", e);
+      throw new HiveException(e.getMessage(), e);
+    }
+    try {
+      destFs = destf.getFileSystem(conf);
+    } catch (IOException e) {
+      LOG.error("Failed to get dest fs", e);
+      throw new HiveException(e.getMessage(), e);
+    }
 
     //needed for perm inheritance.
     boolean inheritPerms = HiveConf.getBoolVar(conf,
         HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS);
     HadoopShims shims = ShimLoader.getHadoopShims();
     HadoopShims.HdfsFileStatus destStatus = null;
-    HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
+    // HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
 
     // If source path is a subdirectory of the destination path:
     //   ex: INSERT OVERWRITE DIRECTORY 'target/warehouse/dest4.out' SELECT src.value WHERE src.key >= 300;
@@ -2608,7 +2625,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
             && !hdfsEncryptionShim.arePathsOnSameEncryptionZone(srcf, destf))
         {
           LOG.info("Copying source " + srcf + " to " + destf + " because HDFS encryption zones are different.");
-          success = FileUtils.copy(srcf.getFileSystem(conf), srcf, destf.getFileSystem(conf), destf,
+          success = FileUtils.copy(srcFs, srcf, destFs, destf,
               true,    // delete source
               replace, // overwrite destination
               conf);
@@ -2617,16 +2634,43 @@ private void constructOneLBLocationMap(FileStatus fSta,
             FileStatus[] srcs = fs.listStatus(srcf, FileUtils.HIDDEN_FILES_PATH_FILTER);
             if (srcs.length == 0) {
               success = true; // Nothing to move.
-            }
-            for (FileStatus status : srcs) {
-              success = FileUtils.copy(srcf.getFileSystem(conf), status.getPath(), destf.getFileSystem(conf), destf,
-                  true,     // delete source
-                  replace,  // overwrite destination
-                  conf);
-
-              if (!success) {
-                throw new HiveException("Unable to move source " + status.getPath() + " to destination " + destf);
+            } else {
+              List<Future<Boolean>> futures = new LinkedList<>();
+              final ExecutorService pool = Executors.newFixedThreadPool(
+                  conf.getIntVar(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT),
+                  new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MoveDir-Thread-%d").build()
+              );
+              /* Move files one by one because source is a subdirectory of destination */
+              for (final FileStatus status : srcs) {
+                futures.add(pool.submit(new Callable<Boolean>() {
+                  @Override
+                  public Boolean call() throws Exception {
+                    return FileUtils.copy(
+                        srcFs, status.getPath(), destFs, destf,
+                        true,     // delete source
+                        replace,  // overwrite destination
+                        conf);
+                  }
+                }));
               }
+              pool.shutdown();
+              // check all future results
+              boolean allFutures = true;
+              for (Future<Boolean> future : futures) {
+                try {
+                  Boolean result = future.get();
+                  allFutures &= result;
+                  if (!result) {
+                    LOG.debug("Failed to rename.");
+                    pool.shutdownNow();
+                  }
+                } catch (Exception e) {
+                  LOG.debug("Failed to rename.", e);
+                  pool.shutdownNow();
+                  throw new HiveException(e.getCause());
+                }
+              }
+              success = allFutures;
             }
           } else {
             success = fs.rename(srcf, destf);
@@ -2667,8 +2711,8 @@ private void constructOneLBLocationMap(FileStatus fSta,
    *                 move will be returned.
    * @throws HiveException
    */
-  static protected void copyFiles(HiveConf conf, Path srcf, Path destf,
-      FileSystem fs, boolean isSrcLocal, boolean isAcid, List<Path> newFiles) throws HiveException {
+  static protected void copyFiles(final HiveConf conf, Path srcf, Path destf,
+      final FileSystem fs, final boolean isSrcLocal, boolean isAcid, final List<Path> newFiles) throws HiveException {
     boolean inheritPerms = HiveConf.getBoolVar(conf,
         HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS);
     try {
@@ -2706,16 +2750,44 @@ private void constructOneLBLocationMap(FileStatus fSta,
       List<List<Path[]>> result = checkPaths(conf, fs, srcs, srcFs, destf, false);
       // move it, move it
       try {
+        final HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
+        final List<Future<ObjectPair<Path[], Boolean>>> futures = new LinkedList<>();
+        final ExecutorService pool = Executors.newFixedThreadPool(
+            conf.getIntVar(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT),
+            new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MoveDir-Thread-%d").build());
         for (List<Path[]> sdpairs : result) {
-          for (Path[] sdpair : sdpairs) {
-            if (!moveFile(conf, sdpair[0], sdpair[1], fs, false, isSrcLocal)) {
-              throw new IOException("Cannot move " + sdpair[0] + " to "
-                  + sdpair[1]);
-            }
-            if (newFiles != null) newFiles.add(sdpair[1]);
+          for (final Path[] sdpair : sdpairs) {
+            futures.add(pool.submit(new Callable<ObjectPair<Path[], Boolean>>() {
+              @Override
+              public ObjectPair<Path[], Boolean> call() throws Exception {
+                if (newFiles != null) {
+                  synchronized (newFiles) {
+                    newFiles.add(sdpair[1]);
+                  }
+                }
+                return ObjectPair.create(sdpair, moveFile(conf, sdpair[0], sdpair[1], fs, false, isSrcLocal, hdfsEncryptionShim));
+              }
+            }));
           }
         }
-      } catch (IOException e) {
+        pool.shutdown();
+        for (Future<ObjectPair<Path[], Boolean>> future : futures) {
+          try {
+            ObjectPair<Path[], Boolean> f = future.get();
+            Path[] sdpair = f.getFirst();
+            Boolean moveResult = f.getSecond();
+            if (!moveResult) {
+              pool.shutdownNow();
+              throw new IOException("Cannot move " + sdpair[0] + " to " + sdpair[1]);
+            }
+            LOG.debug("Moved src: " + sdpair[0] +", to dest: " + sdpair[1]);
+          } catch (Exception e) {
+            LOG.error("Failed to move: " + e.getMessage());
+            pool.shutdownNow();
+            throw new HiveException(e.getCause());
+          }
+        }
+      } catch (Exception e) {
         throw new HiveException("copyFiles: error while moving files!!! " + e.getMessage(), e);
       }
     }
@@ -2860,6 +2932,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
         }
       }
 
+      HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
       // rename src directory to destf
       if (srcs.length == 1 && srcs[0].isDir()) {
         // rename can fail if the parent doesn't exist
@@ -2889,7 +2962,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
                 inheritFromTable(tablePath, destParent, conf, destFs);
               }
             }
-            if (!moveFile(conf, sdpair[0], sdpair[1], destFs, true, isSrcLocal)) {
+            if (!moveFile(conf, sdpair[0], sdpair[1], destFs, true, isSrcLocal, hdfsEncryptionShim)) {
               throw new IOException("Unable to move file/directory from " + sdpair[0] +
                   " to " + sdpair[1]);
             }
@@ -2909,7 +2982,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
         for (List<Path[]> sdpairs : result) {
           for (Path[] sdpair : sdpairs) {
             if (!moveFile(conf, sdpair[0], sdpair[1], destFs, true,
-                isSrcLocal)) {
+                isSrcLocal, hdfsEncryptionShim)) {
               throw new IOException("Error moving: " + sdpair[0] + " into: " + sdpair[1]);
             }
           }

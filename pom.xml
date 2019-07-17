@@ -26,10 +26,14 @@
 
   <!-- See http://central.sonatype.org/pages/apache-maven.html -->
   <distributionManagement>
+<!--    <repository>-->
+<!--      <id>ossrh</id>-->
+<!--      <name>Sonatype Nexus Repository</name>-->
+<!--      <url>https://oss.sonatype.org/service/local/staging/deploy/maven2</url>-->
+<!--    </repository>-->
     <repository>
-      <id>ossrh</id>
-      <name>Sonatype Nexus Repository</name>
-      <url>https://oss.sonatype.org/service/local/staging/deploy/maven2</url>
+      <id>gio</id>
+      <url>http://10.0.1.190:8081/nexus/content/repositories/releases</url>
     </repository>
   </distributionManagement>
 

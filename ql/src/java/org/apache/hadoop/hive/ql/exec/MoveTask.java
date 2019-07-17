@@ -102,7 +102,8 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
         if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_INSERT_INTO_MULTILEVEL_DIRS)) {
           deletePath = createTargetPath(targetPath, fs);
         }
-        if (!Hive.moveFile(conf, sourcePath, targetPath, fs, true, false)) {
+        HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
+        if (!Hive.moveFile(conf, sourcePath, targetPath, fs, true, false, hdfsEncryptionShim)) {
           try {
             if (deletePath != null) {
               fs.delete(deletePath, true);
